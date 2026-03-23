@@ -21,6 +21,8 @@
 	"mounts": [
 		"source=${localEnv:HOME}/.cache,target=/root/.cache,type=bind,consistency=cached",
 		"source=${localEnv:HOME}/.codex,target=/root/.codex,type=bind",
+		"source=${localWorkspaceFolder}/../datasets,target=${containerWorkspaceFolder}/datasets,type=bind,readonly",
+		"source=${localWorkspaceFolder}/../db,target=${containerWorkspaceFolder}/db,type=bind,readonly"
 	],
 	
 	"customizations": {

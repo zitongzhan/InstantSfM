@@ -33,7 +33,11 @@ except ImportError as exc:
     ) from exc
 
 from instantsfm.eval.colmap_eval.evaluation.utils import compute_auc, compute_rel_errors
-from instantsfm.utils.read_write_model import read_cameras_text, read_images_text
+from instantsfm.utils.read_write_model import (
+    read_cameras_text,
+    read_images_binary,
+    read_images_text,
+)
 
 
 # Compatibility aliases for environments where NumPy misses these names.
@@ -52,6 +56,20 @@ class SceneEval:
     errors: np.ndarray
 
 
+@dataclass(frozen=True)
+class _GtImageMatch:
+    image_id: int
+    current_camera_id: int
+    gt_camera_id: int
+    gt_name: str
+
+
+@dataclass(frozen=True)
+class _EvalImage:
+    name: str
+    cam_from_world: pycolmap.Rigid3d
+
+
 class _MergedReconstruction:
     """Minimal wrapper that satisfies compute_rel_errors() API needs."""
 
@@ -60,6 +78,32 @@ class _MergedReconstruction:
 
     def num_images(self) -> int:
         return len(self.images)
+
+
+def load_images_binary_reconstruction(sparse_dir: Path) -> _MergedReconstruction | None:
+    images_bin = sparse_dir / "images.bin"
+    if not images_bin.exists():
+        return None
+
+    try:
+        images = read_images_binary(str(images_bin))
+    except Exception:
+        return None
+
+    wrapped_images: dict[int, _EvalImage] = {}
+    for image in images.values():
+        qvec = np.asarray(image.qvec, dtype=np.float64)
+        xyzw = np.array([qvec[1], qvec[2], qvec[3], qvec[0]], dtype=np.float64)
+        wrapped_images[image.id] = _EvalImage(
+            name=image.name,
+            cam_from_world=pycolmap.Rigid3d(
+                pycolmap.Rotation3d(xyzw),
+                np.asarray(image.tvec, dtype=np.float64),
+            ),
+        )
+    if not wrapped_images:
+        return None
+    return _MergedReconstruction(wrapped_images)
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,17 +251,30 @@ def parse_args() -> argparse.Namespace:
         help="ETH3D GT position accuracy in meters.",
     )
     parser.add_argument(
+        "--inject_gt_camera_ids",
+        action="store_true",
+        help=(
+            "Inject GT camera grouping into database.db before reconstruction/"
+            "evaluation, while preserving features/matches and leaving the "
+            "camera parameter values unchanged."
+        ),
+    )
+    parser.add_argument(
         "--inject_gt_intrinsics",
         action="store_true",
         help=(
             "Inject GT intrinsics from *_calibration_undistorted into database.db "
-            "before reconstruction/evaluation, while preserving features/matches."
+            "before reconstruction/evaluation, while preserving features/matches. "
+            "This also reassigns image camera_ids to the GT grouping first."
         ),
     )
     parser.add_argument(
         "--force_reinject_gt_intrinsics",
         action="store_true",
-        help="Force rebuilding injected database.db from database_orig.db if available.",
+        help=(
+            "Force rebuilding injected database.db from database_orig.db if "
+            "available before GT camera-id and/or intrinsic injection."
+        ),
     )
     return parser.parse_args()
 
@@ -265,6 +322,173 @@ def map_camera_model(model_name: str) -> int:
     return mapping[model_name]
 
 
+def _prepare_injected_db_paths(
+    scene_dir: Path,
+    force_reinject: bool,
+) -> tuple[Path, Path]:
+    database_path = scene_dir / "database.db"
+    backup_db_path = scene_dir / "database_orig.db"
+    if force_reinject and backup_db_path.exists():
+        backup_db_path.unlink()
+    if not backup_db_path.exists():
+        shutil.copy2(database_path, backup_db_path)
+
+    source_db_path = backup_db_path if backup_db_path.exists() else database_path
+    injected_db_path = scene_dir / "database_gtintr.db"
+    if injected_db_path.exists():
+        injected_db_path.unlink()
+    shutil.copy2(source_db_path, injected_db_path)
+    return injected_db_path, source_db_path
+
+
+def _load_gt_image_matches(
+    cur: sqlite3.Cursor,
+    gt_images_path: Path,
+) -> list[_GtImageMatch]:
+    images_gt = read_images_text(str(gt_images_path))
+
+    image_rows = list(cur.execute("SELECT image_id, name, camera_id FROM images ORDER BY image_id"))
+    image_name_to_row: dict[str, tuple[int, int]] = {}
+    basename_to_rows: dict[str, list[tuple[int, int]]] = {}
+    for image_id, name, camera_id in image_rows:
+        image_name_to_row[name] = (image_id, camera_id)
+        basename_to_rows.setdefault(Path(name).name, []).append((image_id, camera_id))
+
+    matches: list[_GtImageMatch] = []
+    for image in sorted(images_gt.values(), key=lambda x: x.id):
+        gt_name = image.name
+        if gt_name in image_name_to_row:
+            image_id, current_camera_id = image_name_to_row[gt_name]
+        else:
+            cands = basename_to_rows.get(Path(gt_name).name, [])
+            if len(cands) != 1:
+                raise ValueError(f"cannot map GT image to DB row: {gt_name}")
+            image_id, current_camera_id = cands[0]
+        matches.append(
+            _GtImageMatch(
+                image_id=image_id,
+                current_camera_id=current_camera_id,
+                gt_camera_id=image.camera_id,
+                gt_name=gt_name,
+            )
+        )
+    return matches
+
+
+def _duplicate_camera_row(cur: sqlite3.Cursor, source_camera_id: int) -> int:
+    row = cur.execute(
+        """
+        SELECT model, width, height, params, prior_focal_length
+        FROM cameras
+        WHERE camera_id = ?
+        """,
+        (source_camera_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"camera_id {source_camera_id} not found in DB")
+    cur.execute(
+        """
+        INSERT INTO cameras(model, width, height, params, prior_focal_length)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        row,
+    )
+    return int(cur.lastrowid)
+
+
+def _inject_gt_camera_ids(
+    cur: sqlite3.Cursor,
+    matches: list[_GtImageMatch],
+) -> dict[int, int]:
+    has_frame_data = (
+        cur.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'frame_data'"
+        ).fetchone()
+        is not None
+    )
+    has_frames = (
+        cur.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'frames'"
+        ).fetchone()
+        is not None
+    )
+    has_rigs = (
+        cur.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rigs'"
+        ).fetchone()
+        is not None
+    )
+    matches_by_gt_camera: dict[int, list[_GtImageMatch]] = {}
+    for match in matches:
+        matches_by_gt_camera.setdefault(match.gt_camera_id, []).append(match)
+
+    gt_camera_to_db_camera: dict[int, int] = {}
+    used_db_camera_ids: set[int] = set()
+    for gt_camera_id in sorted(matches_by_gt_camera):
+        preferred_db_camera_id = min(
+            matches_by_gt_camera[gt_camera_id], key=lambda x: x.image_id
+        ).current_camera_id
+        target_db_camera_id = preferred_db_camera_id
+        if target_db_camera_id in used_db_camera_ids:
+            target_db_camera_id = _duplicate_camera_row(cur, preferred_db_camera_id)
+        gt_camera_to_db_camera[gt_camera_id] = target_db_camera_id
+        used_db_camera_ids.add(target_db_camera_id)
+
+    for match in matches:
+        target_camera_id = gt_camera_to_db_camera[match.gt_camera_id]
+        cur.execute(
+            "UPDATE images SET name = ?, camera_id = ? WHERE image_id = ?",
+            (match.gt_name, target_camera_id, match.image_id),
+        )
+        # Modern COLMAP stores per-frame sensor assignments separately from
+        # images.camera_id. Keep them in sync when regrouping images.
+        if has_frame_data:
+            if has_rigs:
+                rig_row = cur.execute(
+                    "SELECT rig_id FROM rigs WHERE rig_id = ?",
+                    (target_camera_id,),
+                ).fetchone()
+                if rig_row is None:
+                    cur.execute(
+                        """
+                        INSERT INTO rigs(rig_id, ref_sensor_id, ref_sensor_type)
+                        VALUES (?, ?, 0)
+                        """,
+                        (target_camera_id, target_camera_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE rigs
+                        SET ref_sensor_id = ?, ref_sensor_type = 0
+                        WHERE rig_id = ?
+                        """,
+                        (target_camera_id, target_camera_id),
+                    )
+            cur.execute(
+                """
+                UPDATE frame_data
+                SET sensor_id = ?
+                WHERE data_id = ? AND sensor_type = 0
+                """,
+                (target_camera_id, match.image_id),
+            )
+            if has_frames:
+                cur.execute(
+                    """
+                    UPDATE frames
+                    SET rig_id = ?
+                    WHERE frame_id IN (
+                        SELECT frame_id
+                        FROM frame_data
+                        WHERE data_id = ? AND sensor_type = 0
+                    )
+                    """,
+                    (target_camera_id, match.image_id),
+                )
+    return gt_camera_to_db_camera
+
+
 def inject_gt_intrinsics_for_scene(
     scene_dir: Path,
     force_reinject: bool,
@@ -280,74 +504,38 @@ def inject_gt_intrinsics_for_scene(
     if not gt_images_path.exists() or not gt_cameras_path.exists():
         return scene, False, f"missing GT cameras/images under {gt_sparse_path}"
 
-    backup_db_path = scene_dir / "database_orig.db"
-    if force_reinject and backup_db_path.exists():
-        backup_db_path.unlink()
-    if not backup_db_path.exists():
-        shutil.copy2(database_path, backup_db_path)
-
-    source_db_path = backup_db_path if backup_db_path.exists() else database_path
-
-    injected_db_path = scene_dir / "database_gtintr.db"
-    if injected_db_path.exists():
-        injected_db_path.unlink()
-    shutil.copy2(source_db_path, injected_db_path)
-
-    images_gt = read_images_text(str(gt_images_path))
+    injected_db_path, source_db_path = _prepare_injected_db_paths(scene_dir, force_reinject)
     cameras_gt = read_cameras_text(str(gt_cameras_path))
 
     conn = sqlite3.connect(str(injected_db_path))
     cur = conn.cursor()
+    try:
+        matches = _load_gt_image_matches(cur, gt_images_path)
+        gt_camera_to_db_camera = _inject_gt_camera_ids(cur, matches)
+    except ValueError as exc:
+        conn.close()
+        return scene, False, str(exc)
 
-    image_rows = list(cur.execute("SELECT image_id, name, camera_id FROM images"))
-    image_name_to_row: dict[str, tuple[int, int]] = {}
-    basename_to_rows: dict[str, list[tuple[int, int]]] = {}
-    for image_id, name, camera_id in image_rows:
-        image_name_to_row[name] = (image_id, camera_id)
-        basename_to_rows.setdefault(Path(name).name, []).append((image_id, camera_id))
-
-    existing_camera_ids = {row[0] for row in cur.execute("SELECT camera_id FROM cameras")}
-    camera_updates: dict[int, tuple[int, int, int, bytes]] = {}
-
-    for image in images_gt.values():
-        gt_name = image.name
-        if gt_name in image_name_to_row:
-            image_id, existing_camera_id = image_name_to_row[gt_name]
-        else:
-            cands = basename_to_rows.get(Path(gt_name).name, [])
-            if len(cands) != 1:
-                conn.close()
-                return scene, False, f"cannot map GT image to DB row: {gt_name}"
-            image_id, existing_camera_id = cands[0]
-
-        if image.camera_id not in cameras_gt:
+    for gt_camera_id, camera_id in gt_camera_to_db_camera.items():
+        if gt_camera_id not in cameras_gt:
             conn.close()
-            return scene, False, f"GT camera id {image.camera_id} missing for image {gt_name}"
-        gt_cam = cameras_gt[image.camera_id]
-        camera_updates[existing_camera_id] = (
-            map_camera_model(gt_cam.model),
-            gt_cam.width,
-            gt_cam.height,
-            np.asarray(gt_cam.params, dtype=np.float64).tobytes(),
-        )
-
-        # Keep camera_id unchanged for modern COLMAP frame/frame_data consistency.
-        cur.execute("UPDATE images SET name = ? WHERE image_id = ?", (gt_name, image_id))
-
-    for camera_id, (model, width, height, params_blob) in camera_updates.items():
-        if camera_id not in existing_camera_ids:
-            conn.close()
-            return scene, False, f"camera_id {camera_id} not found in DB"
+            return scene, False, f"GT camera id {gt_camera_id} missing in {gt_cameras_path}"
+        gt_cam = cameras_gt[gt_camera_id]
         cur.execute(
             """
             UPDATE cameras
             SET model = ?, width = ?, height = ?, params = ?, prior_focal_length = 1
             WHERE camera_id = ?
             """,
-            (model, width, height, params_blob, camera_id),
+            (
+                map_camera_model(gt_cam.model),
+                gt_cam.width,
+                gt_cam.height,
+                np.asarray(gt_cam.params, dtype=np.float64).tobytes(),
+                camera_id,
+            ),
         )
 
-    # Keep two-view info but avoid NULL epipolar blobs that break some InstantSfM builds.
     zero_mat = np.zeros((3, 3), dtype=np.float64).tobytes()
     cur.execute("UPDATE two_view_geometries SET E = ? WHERE E IS NULL", (zero_mat,))
     cur.execute("UPDATE two_view_geometries SET F = ? WHERE F IS NULL", (zero_mat,))
@@ -357,7 +545,68 @@ def inject_gt_intrinsics_for_scene(
     conn.close()
 
     os.replace(injected_db_path, database_path)
-    return scene, True, f"injected_from={source_db_path.name}"
+    return (
+        scene,
+        True,
+        f"injected_from={source_db_path.name}; grouped_cameras={len(gt_camera_to_db_camera)}",
+    )
+
+
+def inject_gt_camera_ids_for_scene(
+    scene_dir: Path,
+    force_reinject: bool,
+) -> tuple[str, bool, str]:
+    scene = scene_dir.name
+    database_path = scene_dir / "database.db"
+    if not database_path.exists():
+        return scene, False, f"missing database: {database_path}"
+
+    gt_sparse_path = find_gt_sparse_path(scene_dir)
+    gt_images_path = gt_sparse_path / "images.txt"
+    if not gt_images_path.exists():
+        return scene, False, f"missing GT images under {gt_sparse_path}"
+
+    injected_db_path, source_db_path = _prepare_injected_db_paths(scene_dir, force_reinject)
+
+    conn = sqlite3.connect(str(injected_db_path))
+    cur = conn.cursor()
+    try:
+        matches = _load_gt_image_matches(cur, gt_images_path)
+        gt_camera_to_db_camera = _inject_gt_camera_ids(cur, matches)
+    except ValueError as exc:
+        conn.close()
+        return scene, False, str(exc)
+
+    zero_mat = np.zeros((3, 3), dtype=np.float64).tobytes()
+    cur.execute("UPDATE two_view_geometries SET E = ? WHERE E IS NULL", (zero_mat,))
+    cur.execute("UPDATE two_view_geometries SET F = ? WHERE F IS NULL", (zero_mat,))
+    cur.execute("UPDATE two_view_geometries SET H = ? WHERE H IS NULL", (zero_mat,))
+
+    conn.commit()
+    conn.close()
+
+    os.replace(injected_db_path, database_path)
+    return (
+        scene,
+        True,
+        f"injected_from={source_db_path.name}; grouped_cameras={len(gt_camera_to_db_camera)}",
+    )
+
+
+def inject_gt_camera_ids_batch(
+    args: argparse.Namespace,
+    scenes: Iterable[str],
+) -> list[tuple[str, bool, str]]:
+    records: list[tuple[str, bool, str]] = []
+    for scene in scenes:
+        records.append(
+            inject_gt_camera_ids_for_scene(
+                args.dslr_root / scene,
+                force_reinject=args.force_reinject_gt_intrinsics,
+            )
+        )
+    records.sort(key=lambda x: x[0])
+    return records
 
 
 def inject_gt_intrinsics_batch(
@@ -654,11 +903,15 @@ def merge_sparse_components(sparse_dir: Path) -> tuple[_MergedReconstruction | N
             continue
         try:
             recon = pycolmap.Reconstruction(subdir)
+            component_images = list(recon.images.values())
+            components.append(recon)  # keep alive while image objects are used
         except Exception:
-            continue
-        components.append(recon)  # keep alive while image objects are used
+            recon_fallback = load_images_binary_reconstruction(subdir)
+            if recon_fallback is None:
+                continue
+            component_images = list(recon_fallback.images.values())
         num_components += 1
-        for image in recon.images.values():
+        for image in component_images:
             key = image.name.split("/")[-1]
             if key not in merged_by_name:
                 merged_by_name[key] = image
@@ -770,16 +1023,16 @@ def write_compare_csv(
                     scene,
                     f"{i.aucs[0]:.6f}",
                     f"{g.aucs[0]:.6f}",
-                    f"{(g.aucs[0] - i.aucs[0]):.6f}",
+                    f"{(i.aucs[0] - g.aucs[0]):.6f}",
                     f"{i.aucs[1]:.6f}",
                     f"{g.aucs[1]:.6f}",
-                    f"{(g.aucs[1] - i.aucs[1]):.6f}",
+                    f"{(i.aucs[1] - g.aucs[1]):.6f}",
                     f"{i.aucs[2]:.6f}",
                     f"{g.aucs[2]:.6f}",
-                    f"{(g.aucs[2] - i.aucs[2]):.6f}",
+                    f"{(i.aucs[2] - g.aucs[2]):.6f}",
                     f"{i.aucs[3]:.6f}",
                     f"{g.aucs[3]:.6f}",
-                    f"{(g.aucs[3] - i.aucs[3]):.6f}",
+                    f"{(i.aucs[3] - g.aucs[3]):.6f}",
                     i.num_reg_images,
                     g.num_reg_images,
                     i.num_images,
@@ -792,6 +1045,18 @@ def main() -> None:
     scenes = discover_scenes(args)
     if not scenes:
         raise SystemExit("No scenes found to evaluate.")
+
+    if args.inject_gt_camera_ids:
+        records = inject_gt_camera_ids_batch(args, scenes)
+        status_path = args.output_dir / f"{args.prefix}_gtcameraids_status.tsv"
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        with status_path.open("w") as f:
+            f.write("scene\tok\tdetail\n")
+            for scene, ok, detail in records:
+                f.write(f"{scene}\t{int(ok)}\t{detail}\n")
+        num_ok = sum(1 for _, ok, _ in records if ok)
+        print(f"GT-camera-id injection status: {num_ok}/{len(records)} scenes successful.")
+        print(f"GT-camera-id status file: {status_path}")
 
     if args.inject_gt_intrinsics:
         records = inject_gt_intrinsics_batch(args, scenes)
@@ -865,10 +1130,10 @@ def main() -> None:
     print("Summary (AUC@1/3/5/10):")
     print("  InstantSfM __all__:", ", ".join(f"{v:.6f}" for v in inst_all))
     print("  GLOMAP    __all__:", ", ".join(f"{v:.6f}" for v in glo_all))
-    print("  Delta     __all__:", ", ".join(f"{(g - i):.6f}" for i, g in zip(inst_all, glo_all)))
+    print("  Delta     __all__:", ", ".join(f"{(i - g):.6f}" for i, g in zip(inst_all, glo_all)))
     print("  InstantSfM __avg__:", ", ".join(f"{v:.6f}" for v in inst_avg))
     print("  GLOMAP    __avg__:", ", ".join(f"{v:.6f}" for v in glo_avg))
-    print("  Delta     __avg__:", ", ".join(f"{(g - i):.6f}" for i, g in zip(inst_avg, glo_avg)))
+    print("  Delta     __avg__:", ", ".join(f"{(i - g):.6f}" for i, g in zip(inst_avg, glo_avg)))
 
 
 if __name__ == "__main__":
