@@ -68,6 +68,7 @@ CONFIG = {
         'min_num_view_per_track': 2,
         'complete_max_reproj_error': 3.0,
         'merge_max_reproj_error': 3.0,
+        're_max_angle_error': 3.0,
         'filter_max_reproj_error': 3.0,
         'filter_min_tri_angle': 1.5,
         'ba_global_max_refinements': 5,
