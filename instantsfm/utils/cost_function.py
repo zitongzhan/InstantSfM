@@ -20,12 +20,11 @@ def fetzer_cost(fi, fj, ds):
     return loss
 
 @map_transform
-def pairwise_cost(points, camera_translations, scales, translations, is_calibrated):
+def pairwise_cost(points, camera_translations, scales, translations, calibration_weights):
     positions1 = camera_translations
     positions2 = points
     loss = translations - scales * (positions2 - positions1)
-    calibrated_factor = torch.where(is_calibrated, 1.0, 0.5).unsqueeze(-1)
-    loss = loss * calibrated_factor
+    loss = loss * calibration_weights.unsqueeze(-1)
     return loss
 
 # functions that reproject points from cameras to images, each function is based on a different camera model

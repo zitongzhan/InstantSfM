@@ -15,7 +15,26 @@ from bae.optim import LM
 from bae.autograd.function import TrackingTensor
 
 
-def _prepare_single_camera_data(cameras, images, tracks, device, min_observations, use_depths):
+def _camera_calibration_weight(camera, refined_focal_weight, uncalibrated_weight):
+    if camera.has_prior_focal_length:
+        return 1.0
+    if getattr(camera, "has_refined_focal_length", False):
+        confidence = float(getattr(camera, "refined_focal_confidence", 1.0))
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+        return uncalibrated_weight + (refined_focal_weight - uncalibrated_weight) * confidence
+    return uncalibrated_weight
+
+
+def _prepare_single_camera_data(
+    cameras,
+    images,
+    tracks,
+    device,
+    min_observations,
+    use_depths,
+    refined_focal_weight,
+    uncalibrated_weight,
+):
     """Prepare all data for single camera optimization."""
     # Filter tracks by observation count
     valid_mask = np.array([tracks.observations[i].shape[0] >= min_observations 
@@ -72,9 +91,16 @@ def _prepare_single_camera_data(cameras, images, tracks, device, min_observation
     translations = torch.tensor(np.array(translations_list), dtype=torch.float64, device=device)
     image_indices = torch.tensor(np.array(image_indices_list), dtype=torch.int32, device=device)
     point_indices = torch.tensor(np.array(point_indices_list), dtype=torch.int32, device=device)
-    is_calibrated = torch.tensor([cameras[images.cam_ids[idx]].has_prior_focal_length 
-                                 for idx in registered_indices], 
-                                 dtype=torch.bool, device=device)
+    calibration_weights = torch.tensor(
+        [
+            _camera_calibration_weight(
+                cameras[images.cam_ids[idx]], refined_focal_weight, uncalibrated_weight
+            )
+            for idx in registered_indices
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
     
     if use_depths:
         scales = torch.tensor(depth_values_list, dtype=torch.float64, device=device).unsqueeze(1)
@@ -85,10 +111,20 @@ def _prepare_single_camera_data(cameras, images, tracks, device, min_observation
         scale_indices = None
     
     return (image_translations, points_3d, scales, scale_indices, 
-            translations, image_indices, point_indices, is_calibrated, image_idx2id)
+            translations, image_indices, point_indices, calibration_weights, image_idx2id)
 
 
-def _prepare_multi_rig_data(cameras, images, tracks, device, min_observations, use_depths, use_fixed_rel_poses):
+def _prepare_multi_rig_data(
+    cameras,
+    images,
+    tracks,
+    device,
+    min_observations,
+    use_depths,
+    use_fixed_rel_poses,
+    refined_focal_weight,
+    uncalibrated_weight,
+):
     """Prepare all data for multi-camera rig optimization."""
     # Filter tracks by observation count
     valid_mask = np.array([tracks.observations[i].shape[0] >= min_observations 
@@ -175,9 +211,16 @@ def _prepare_multi_rig_data(cameras, images, tracks, device, min_observations, u
     grouping_indices = torch.tensor(np.array(list(zip(image_group_indices_list, image_member_indices_list))), 
                                    dtype=torch.int32, device=device)
     point_indices = torch.tensor(np.array(point_indices_list), dtype=torch.int32, device=device)
-    is_calibrated = torch.tensor([cameras[images.cam_ids[idx]].has_prior_focal_length 
-                                 for idx in registered_indices], 
-                                 dtype=torch.bool, device=device)
+    calibration_weights = torch.tensor(
+        [
+            _camera_calibration_weight(
+                cameras[images.cam_ids[idx]], refined_focal_weight, uncalibrated_weight
+            )
+            for idx in registered_indices
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
     
     if use_depths:
         scales = torch.tensor(depth_values_list, dtype=torch.float64, device=device).unsqueeze(1)
@@ -188,7 +231,7 @@ def _prepare_multi_rig_data(cameras, images, tracks, device, min_observations, u
         scale_indices = None
     
     return (points_3d, scales, ref_trans, rel_trans, ref_rots, rel_rots, scale_indices,
-            feature_undist, grouping_indices, point_indices, is_calibrated,
+            feature_undist, grouping_indices, point_indices, calibration_weights,
             registered_group_indices)
 
 
@@ -268,23 +311,41 @@ class TorchGP():
 
         # Prepare all data
         (image_translations, points_3d, scales, scale_indices, 
-         translations, image_indices, point_indices, is_calibrated, image_idx2id) = _prepare_single_camera_data(
-            cameras, images, tracks, self.device, 
-            GLOBAL_POSITIONER_OPTIONS['min_num_view_per_track'], use_depths
+         translations, image_indices, point_indices, calibration_weights, image_idx2id) = _prepare_single_camera_data(
+            cameras,
+            images,
+            tracks,
+            self.device,
+            GLOBAL_POSITIONER_OPTIONS['min_num_view_per_track'],
+            use_depths,
+            GLOBAL_POSITIONER_OPTIONS.get('refined_focal_weight', 0.75),
+            GLOBAL_POSITIONER_OPTIONS.get('uncalibrated_weight', 0.5),
         )
 
         # Create model and optimizer
         model = PairwiseSingleCameraModel(image_translations, points_3d, scales, cost_fn, scale_indices=scale_indices)
-        strategy = pp.optim.strategy.TrustRegion(radius=1e3, max=1e8, up=2.0, down=0.5**4)
-        sparse_solver = PCG(tol=1e-5)
+        strategy = pp.optim.strategy.TrustRegion(
+            radius=GLOBAL_POSITIONER_OPTIONS.get('trust_region_radius', 1e3),
+            max=GLOBAL_POSITIONER_OPTIONS.get('trust_region_max_radius', 1e8),
+            up=GLOBAL_POSITIONER_OPTIONS.get('trust_region_up', 2.0),
+            down=GLOBAL_POSITIONER_OPTIONS.get('trust_region_down', 0.5**4),
+        )
+        sparse_solver = PCG(tol=GLOBAL_POSITIONER_OPTIONS.get('pcg_tol', 1e-5))
         huber_kernel = Huber(GLOBAL_POSITIONER_OPTIONS['thres_loss_function'])
-        optimizer = LM(model, strategy=strategy, solver=sparse_solver, kernel=huber_kernel, reject=30)
+        optimizer = LM(
+            model,
+            strategy=strategy,
+            solver=sparse_solver,
+            kernel=huber_kernel,
+            reject=30,
+            min=GLOBAL_POSITIONER_OPTIONS.get('lm_damping_min', 1e-6),
+        )
 
         input = {
             "translations": translations,
             "image_indices": image_indices,
             "point_indices": point_indices,
-            "is_calibrated": is_calibrated,
+            "calibration_weights": calibration_weights,
         }
 
         # Run optimization
@@ -314,10 +375,17 @@ class TorchGP():
         
         # Prepare all data
         (points_3d, scales, ref_trans, rel_trans, ref_rots, rel_rots, scale_indices,
-         feature_undist, grouping_indices, point_indices, is_calibrated,
+         feature_undist, grouping_indices, point_indices, calibration_weights,
          registered_group_indices) = _prepare_multi_rig_data(
-            cameras, images, tracks, self.device,
-            GLOBAL_POSITIONER_OPTIONS['min_num_view_per_track'], use_depths, use_fixed_rel_poses
+            cameras,
+            images,
+            tracks,
+            self.device,
+            GLOBAL_POSITIONER_OPTIONS['min_num_view_per_track'],
+            use_depths,
+            use_fixed_rel_poses,
+            GLOBAL_POSITIONER_OPTIONS.get('refined_focal_weight', 0.75),
+            GLOBAL_POSITIONER_OPTIONS.get('uncalibrated_weight', 0.5),
         )
 
         # Create model and optimizer
@@ -329,16 +397,28 @@ class TorchGP():
             # Use regular model when rel_trans are optimized (nn.Parameter)
             model = PairwiseMultiRigModel(points_3d, scales, ref_trans, rel_trans,
                                          cost_fn, scale_indices=scale_indices)
-        strategy = pp.optim.strategy.TrustRegion(radius=1e3, max=1e8, up=2.0, down=0.5**4)
-        sparse_solver = PCG(tol=1e-5)
+        strategy = pp.optim.strategy.TrustRegion(
+            radius=GLOBAL_POSITIONER_OPTIONS.get('trust_region_radius', 1e3),
+            max=GLOBAL_POSITIONER_OPTIONS.get('trust_region_max_radius', 1e8),
+            up=GLOBAL_POSITIONER_OPTIONS.get('trust_region_up', 2.0),
+            down=GLOBAL_POSITIONER_OPTIONS.get('trust_region_down', 0.5**4),
+        )
+        sparse_solver = PCG(tol=GLOBAL_POSITIONER_OPTIONS.get('pcg_tol', 1e-5))
         huber_kernel = Huber(GLOBAL_POSITIONER_OPTIONS['thres_loss_function'])
-        optimizer = LM(model, strategy=strategy, solver=sparse_solver, kernel=huber_kernel, reject=30)
+        optimizer = LM(
+            model,
+            strategy=strategy,
+            solver=sparse_solver,
+            kernel=huber_kernel,
+            reject=30,
+            min=GLOBAL_POSITIONER_OPTIONS.get('lm_damping_min', 1e-6),
+        )
 
         input = {
             "feature_undist": feature_undist,
             "grouping_indices": grouping_indices,
             "point_indices": point_indices,
-            "is_calibrated": is_calibrated,
+            "calibration_weights": calibration_weights,
             "ref_rots": ref_rots,
             "rel_rots": rel_rots
         }

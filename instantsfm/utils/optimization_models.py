@@ -431,7 +431,7 @@ class PairwiseSingleCameraModel(nn.Module):
             all_indices = torch.arange(scales.shape[0], device=scales.device)
             self.scales.optimize_indices = all_indices[~torch.isin(all_indices, scale_indices)]
 
-    def forward(self, translations, image_indices, point_indices, is_calibrated):
+    def forward(self, translations, image_indices, point_indices, calibration_weights):
         """
         Forward pass computing pairwise positioning residuals.
         
@@ -439,7 +439,7 @@ class PairwiseSingleCameraModel(nn.Module):
             translations: [N, 3] ray directions for each observation
             image_indices: [N] image index for each observation
             point_indices: [N] 3D point index for each observation
-            is_calibrated: [num_imgs] whether each camera is calibrated
+            calibration_weights: [num_imgs] per-camera pairwise weighting
             
         Returns:
             [N, 3] pairwise positioning residuals
@@ -449,7 +449,7 @@ class PairwiseSingleCameraModel(nn.Module):
             self.translations[image_indices],
             self.scales,
             translations,
-            is_calibrated[image_indices]
+            calibration_weights[image_indices]
         )
         return loss
 
@@ -482,7 +482,7 @@ class PairwiseMultiRigModel(nn.Module):
             all_indices = torch.arange(scales.shape[0], device=scales.device)
             self.scales.optimize_indices = all_indices[~torch.isin(all_indices, scale_indices)]
 
-    def forward(self, feature_undist, grouping_indices, point_indices, is_calibrated, ref_rots, rel_rots):
+    def forward(self, feature_undist, grouping_indices, point_indices, calibration_weights, ref_rots, rel_rots):
         """
         Forward pass computing pairwise positioning residuals for multi-rig.
         
@@ -490,7 +490,7 @@ class PairwiseMultiRigModel(nn.Module):
             feature_undist: [N, 3] undistorted feature directions for each observation
             grouping_indices: [N, 2] (group_idx, member_idx) for each observation
             point_indices: [N] 3D point index for each observation
-            is_calibrated: [num_groups] whether each rig group is calibrated
+            calibration_weights: [num_groups] per-group pairwise weighting
             ref_rots: [num_groups, 4] reference rotations for each rig group (fixed)
             rel_rots: [num_positions, 4] relative rotations for each camera position (fixed)
             
@@ -511,7 +511,7 @@ class PairwiseMultiRigModel(nn.Module):
         pose_t = calc_trans(ref_R, ref_t, rel_R, rel_t)
         
         translations = pose_R.Inv() @ feature_undist
-        calib_mask = is_calibrated[group_idx]
+        calib_mask = calibration_weights[group_idx]
         loss = self.cost_fn(
             self.points_3d[point_indices],
             pose_t,
@@ -550,7 +550,7 @@ class PairwiseMultiRigModelFixedRel(nn.Module):
             all_indices = torch.arange(scales.shape[0], device=scales.device)
             self.scales.optimize_indices = all_indices[~torch.isin(all_indices, scale_indices)]
 
-    def forward(self, feature_undist, grouping_indices, point_indices, is_calibrated, ref_rots, rel_rots, rel_trans):
+    def forward(self, feature_undist, grouping_indices, point_indices, calibration_weights, ref_rots, rel_rots, rel_trans):
         """
         Forward pass computing pairwise positioning residuals for multi-rig.
         
@@ -558,7 +558,7 @@ class PairwiseMultiRigModelFixedRel(nn.Module):
             feature_undist: [N, 3] undistorted feature directions for each observation
             grouping_indices: [N, 2] (group_idx, member_idx) for each observation
             point_indices: [N] 3D point index for each observation
-            is_calibrated: [num_groups] whether each rig group is calibrated
+            calibration_weights: [num_groups] per-group pairwise weighting
             ref_rots: [num_groups, 4] reference rotations for each rig group (fixed)
             rel_rots: [num_positions, 4] relative rotations for each camera position (fixed)
             rel_trans: [num_positions, 3] FIXED relative translations for each camera position
@@ -580,7 +580,7 @@ class PairwiseMultiRigModelFixedRel(nn.Module):
         pose_t = calc_trans(ref_R, ref_t, rel_R, rel_t)
         
         translations = pose_R.Inv() @ feature_undist
-        calib_mask = is_calibrated[group_idx]
+        calib_mask = calibration_weights[group_idx]
         loss = self.cost_fn(
             self.points_3d[point_indices],
             pose_t,

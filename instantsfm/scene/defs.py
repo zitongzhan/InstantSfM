@@ -675,6 +675,22 @@ class CameraView:
         self._container.has_prior_focal_length[self._index] = value
 
     @property
+    def has_refined_focal_length(self) -> bool:
+        return bool(self._container.has_refined_focal_length[self._index])
+
+    @has_refined_focal_length.setter
+    def has_refined_focal_length(self, value: bool):
+        self._container.has_refined_focal_length[self._index] = value
+
+    @property
+    def refined_focal_confidence(self) -> float:
+        return float(self._container.refined_focal_confidence[self._index])
+
+    @refined_focal_confidence.setter
+    def refined_focal_confidence(self, value: float):
+        self._container.refined_focal_confidence[self._index] = value
+
+    @property
     def params(self) -> np.ndarray:
         count = self._container.param_sizes[self._index]
         return self._container.params[self._index, :count]
@@ -755,6 +771,8 @@ class Cameras:
         self.widths = np.zeros(num_cameras, dtype=np.int32)
         self.heights = np.zeros(num_cameras, dtype=np.int32)
         self.has_prior_focal_length = np.zeros(num_cameras, dtype=bool)
+        self.has_refined_focal_length = np.zeros(num_cameras, dtype=bool)
+        self.refined_focal_confidence = np.zeros(num_cameras, dtype=np.float64)
         self.focal_lengths = np.zeros((num_cameras, 2), dtype=np.float64)
         self.principal_points = np.zeros((num_cameras, 2), dtype=np.float64)
         self.k_params = np.zeros((num_cameras, 6), dtype=np.float64)
