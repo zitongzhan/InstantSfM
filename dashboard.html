@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="InstantSfM KPI dashboard for commit-by-commit evaluation tracking.">
+  <title>InstantSfM KPI Dashboard</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./static/css/dashboard.css">
+</head>
+<body>
+  <main class="dashboard-shell">
+    <section class="hero-panel">
+      <div class="hero-copy">
+        <p class="eyebrow">InstantSfM</p>
+        <h1>Commit-by-commit KPI dashboard</h1>
+        <p class="hero-text">
+          Track evaluation performance over time, switch between discovered AUC metrics, and inspect per-scene regressions or gains across commits.
+        </p>
+      </div>
+      <div class="hero-meta">
+        <div class="meta-card">
+          <span class="meta-label">Dataset</span>
+          <select id="dataset-select" class="control"></select>
+        </div>
+        <div class="meta-card">
+          <span class="meta-label">Metric</span>
+          <select id="metric-select" class="control"></select>
+        </div>
+      </div>
+    </section>
+
+    <section class="summary-grid">
+      <article class="stat-card">
+        <span class="stat-label">Latest value</span>
+        <strong id="latest-value" class="stat-value">--</strong>
+        <span id="latest-context" class="stat-context">Waiting for data</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">Delta vs previous</span>
+        <strong id="delta-value" class="stat-value">--</strong>
+        <span id="delta-context" class="stat-context">No previous commit</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">Tracked commits</span>
+        <strong id="commit-count" class="stat-value">0</strong>
+        <span id="commit-range" class="stat-context">No history yet</span>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <p class="panel-kicker">Trend</p>
+          <h2>Summary trajectory</h2>
+        </div>
+        <p class="panel-note">Dots show each commit; the line emphasizes overall movement.</p>
+      </div>
+      <div id="trend-chart" class="chart-wrap"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <p class="panel-kicker">Per scene</p>
+          <h2>Scene-by-scene matrix</h2>
+        </div>
+        <p class="panel-note">
+          Cell colors encode change versus the previous commit for the selected metric. Green improves, red regresses.
+        </p>
+      </div>
+      <div id="matrix-wrap" class="matrix-wrap"></div>
+    </section>
+
+    <section id="empty-state" class="panel empty-state" hidden>
+      <h2>No performance manifest found</h2>
+      <p>
+        Add evaluation CSV files under <code>performance-data/</code> and run the generator or GitHub Pages workflow to populate this dashboard.
+      </p>
+    </section>
+  </main>
+
+  <script src="./static/js/dashboard.js"></script>
+</body>
+</html>
