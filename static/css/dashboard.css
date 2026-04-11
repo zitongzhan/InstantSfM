@@ -183,6 +183,37 @@ code,
   stroke-width: 3;
 }
 
+.trend-point-group {
+  cursor: pointer;
+}
+
+.trend-point-group:focus {
+  outline: none;
+}
+
+.trend-tooltip-text {
+  display: none;
+  fill: var(--text);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  font-weight: 500;
+  paint-order: stroke;
+  stroke: #fffaf4;
+  stroke-width: 6px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
+.trend-point-group:hover .trend-tooltip-text,
+.trend-point-group:focus .trend-tooltip-text {
+  display: block;
+}
+
+.trend-point-group:hover .trend-point,
+.trend-point-group:focus .trend-point {
+  fill: var(--accent);
+}
+
 .matrix-wrap {
   overflow: auto;
 }

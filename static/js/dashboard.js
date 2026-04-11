@@ -180,10 +180,12 @@
     const points = plottedPoints.map((item) => {
       const cx = x(item.index);
       const cy = y(item.value);
-      const title = `${item.commit.short_commit} • ${formatDate(item.commit.committed_at)} • ${formatValue(item.value)}`;
+      const label = formatValue(item.value);
+      const title = `${item.commit.short_commit} • ${formatDate(item.commit.committed_at)} • ${label}`;
       return `
-        <g>
+        <g class="trend-point-group" tabindex="0" focusable="true" role="img" aria-label="${escapeHtml(title)}">
           <title>${escapeHtml(title)}</title>
+          <text class="trend-tooltip-text" x="${cx}" y="${cy - 14}" text-anchor="middle">${escapeHtml(label)}</text>
           <circle class="trend-point" cx="${cx}" cy="${cy}" r="6"></circle>
         </g>
       `;
@@ -219,8 +221,10 @@
       const cells = commits.map((commit, index) => {
         const current = getMetricValue(commit.scenes[scene], state.metric);
         const previous = index > 0 ? getMetricValue(commits[index - 1].scenes[scene], state.metric) : null;
-        const delta = current != null && previous != null ? current - previous : null;
-        const background = delta == null ? "rgba(var(--neutral), 0.08)" : colorForDelta(delta);
+        const delta = current != null && previous != null
+          ? fromDisplayUnits(toDisplayUnits(current) - toDisplayUnits(previous))
+          : null;
+        const background = delta == null || delta === 0 ? "rgba(var(--neutral), 0.08)" : colorForDelta(delta);
         const title = delta == null
           ? `${scene} • ${commit.short_commit} • ${formatValue(current)}`
           : `${scene} • ${commit.short_commit} • ${formatValue(current)} (${signedValue(delta)} vs previous)`;
@@ -280,12 +284,26 @@
     return `rgba(${rgb}, ${alpha})`;
   }
 
+  function toDisplayUnits(value) {
+    return value == null ? null : Math.round(Number(value) * 100);
+  }
+
+  function fromDisplayUnits(value) {
+    return value == null ? null : value / 100;
+  }
+
   function formatValue(value) {
     return value == null ? "--" : Number(value).toFixed(2);
   }
 
   function signedValue(value) {
-    return value == null ? "--" : `${value >= 0 ? "+" : ""}${Number(value).toFixed(2)}`;
+    if (value == null) {
+      return "--";
+    }
+    if (Object.is(value, 0)) {
+      return "0.00";
+    }
+    return `${value >= 0 ? "+" : ""}${Number(value).toFixed(2)}`;
   }
 
   function formatDate(value, compact) {
