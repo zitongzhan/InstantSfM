@@ -70,6 +70,38 @@ def _point_angular_reprojection_is_valid(images, xyz, image_id, feature_id, max_
     return angle_deg <= max_angle_deg
 
 
+def _track_supports_observation(
+    cameras,
+    images,
+    xyz,
+    track_obs,
+    obs,
+    reproj_threshold,
+    max_angle_deg=None,
+):
+    image_id = int(obs[0])
+    if image_id in track_obs[:, 0]:
+        return False
+
+    if max_angle_deg is not None and not _point_angular_reprojection_is_valid(
+        images, xyz, image_id, int(obs[1]), max_angle_deg
+    ):
+        return False
+
+    all_obs = np.vstack([track_obs, np.asarray(obs, dtype=np.int32).reshape(1, 2)])
+    for obs_image_id, obs_feature_id in all_obs:
+        if not _point_reprojection_is_valid(
+            cameras,
+            images,
+            xyz,
+            int(obs_image_id),
+            int(obs_feature_id),
+            reproj_threshold,
+        ):
+            return False
+    return True
+
+
 def _triangulation_angle_is_valid(images, xyz, obs1, obs2, min_angle_deg):
     image_ids = np.array([int(obs1[0]), int(obs2[0])], dtype=np.int32)
     Rs = images.world2cams[image_ids, :3, :3]
@@ -159,11 +191,14 @@ def retriangulate_underreconstructed_pairs(view_graph, cameras, images, tracks, 
                 continue
 
             if track_idx1 is not None:
-                if (
-                    obs2[0] not in tracks.observations[track_idx1][:, 0]
-                    and _point_angular_reprojection_is_valid(
-                        images, tracks.xyzs[track_idx1], obs2[0], obs2[1], re_max_angle_error
-                    )
+                if _track_supports_observation(
+                    cameras,
+                    images,
+                    tracks.xyzs[track_idx1],
+                    tracks.observations[track_idx1],
+                    obs2,
+                    reproj_threshold,
+                    max_angle_deg=re_max_angle_error,
                 ):
                     tracks.observations[track_idx1] = np.vstack(
                         [tracks.observations[track_idx1], np.asarray(obs2, dtype=np.int32).reshape(1, 2)]
@@ -173,11 +208,14 @@ def retriangulate_underreconstructed_pairs(view_graph, cameras, images, tracks, 
                 continue
 
             if track_idx2 is not None:
-                if (
-                    obs1[0] not in tracks.observations[track_idx2][:, 0]
-                    and _point_angular_reprojection_is_valid(
-                        images, tracks.xyzs[track_idx2], obs1[0], obs1[1], re_max_angle_error
-                    )
+                if _track_supports_observation(
+                    cameras,
+                    images,
+                    tracks.xyzs[track_idx2],
+                    tracks.observations[track_idx2],
+                    obs1,
+                    reproj_threshold,
+                    max_angle_deg=re_max_angle_error,
                 ):
                     tracks.observations[track_idx2] = np.vstack(
                         [tracks.observations[track_idx2], np.asarray(obs1, dtype=np.int32).reshape(1, 2)]
@@ -490,9 +528,13 @@ def RetriangulateTracks(view_graph, cameras, images, tracks, tracks_orig, TRIANG
         num_observations_before = count_observations(tracks)
         ba_engine = TorchBA()
         ba_engine.Solve(cameras, images, tracks, BUNDLE_ADJUSTER_OPTIONS)
+        images.is_registered[:] = image_registered
         num_changed_observations = 0
         num_changed_observations += abs(
             complete_and_merge_tracks(view_graph, cameras, images, tracks, tracks_orig, TRIANGULATOR_OPTIONS)
+        )
+        num_changed_observations += retriangulate_underreconstructed_pairs(
+            view_graph, cameras, images, tracks, TRIANGULATOR_OPTIONS, pair_retry_counts
         )
         num_changed_observations += filter_points(
             cameras,

@@ -53,6 +53,8 @@ CONFIG = {
         'thres_loss_function': 1e-1,
         'max_num_iterations': 100,
         'function_tolerance': 5e-4,
+        'num_restarts_calibrated': 1,
+        'num_restarts_uncalibrated': 2,
     },
     'BUNDLE_ADJUSTER_OPTIONS': {
         'optimize_poses': True,
