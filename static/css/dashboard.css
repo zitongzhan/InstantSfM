@@ -276,6 +276,44 @@ code,
 
 .matrix-cell {
   font-variant-numeric: tabular-nums;
+  min-width: 132px;
+  vertical-align: top;
+}
+
+.matrix-value {
+  font-size: 0.96rem;
+  font-weight: 500;
+}
+
+.matrix-camera-meta {
+  margin-top: 6px;
+  display: grid;
+  gap: 2px;
+  color: var(--muted);
+  justify-items: center;
+  font-size: 0.75rem;
+}
+
+.matrix-camera-count {
+  white-space: nowrap;
+}
+
+.matrix-camera-delta {
+  font-size: 0.96rem;
+  line-height: 1.1;
+  font-weight: 700;
+}
+
+.matrix-camera-delta.is-up {
+  color: rgb(var(--gain));
+}
+
+.matrix-camera-delta.is-down {
+  color: rgb(var(--loss));
+}
+
+.matrix-camera-delta.is-neutral {
+  color: var(--muted);
 }
 
 .empty-state {

@@ -1,6 +1,8 @@
 (function () {
   const MANIFEST_URL = "./static/data/performance-manifest.json";
   const AVERAGE_KEY = "__average__";
+  const REGISTERED_IMAGES_KEY = "num_reg_images";
+  const TOTAL_IMAGES_KEY = "num_images";
 
   const state = {
     manifest: null,
@@ -219,18 +221,40 @@
 
     const rows = scenes.map((scene) => {
       const cells = commits.map((commit, index) => {
-        const current = getMetricValue(commit.scenes[scene], state.metric);
-        const previous = index > 0 ? getMetricValue(commits[index - 1].scenes[scene], state.metric) : null;
+        const sceneRecord = commit.scenes[scene];
+        const previousRecord = index > 0 ? commits[index - 1].scenes[scene] : null;
+        const current = getMetricValue(sceneRecord, state.metric);
+        const previous = index > 0 ? getMetricValue(previousRecord, state.metric) : null;
         const delta = current != null && previous != null
           ? fromDisplayUnits(toDisplayUnits(current) - toDisplayUnits(previous))
           : null;
         const background = delta == null || delta === 0 ? "rgba(var(--neutral), 0.08)" : colorForDelta(delta);
-        const title = delta == null
-          ? `${scene} • ${commit.short_commit} • ${formatValue(current)}`
-          : `${scene} • ${commit.short_commit} • ${formatValue(current)} (${signedValue(delta)} vs previous)`;
+        const cameraSummary = formatCameraSummary(sceneRecord);
+        const cameraDelta = getCameraDelta(sceneRecord, previousRecord);
+        const cameraDeltaLabel = formatSignedCount(cameraDelta);
+        const cameraDeltaClass = cameraDelta == null || cameraDelta === 0
+          ? "is-neutral"
+          : cameraDelta > 0 ? "is-up" : "is-down";
+        const titleParts = [
+          `${scene} • ${commit.short_commit} • ${formatValue(current)}`,
+        ];
+        if (delta != null) {
+          titleParts.push(`${signedValue(delta)} vs previous`);
+        }
+        if (cameraSummary !== "--") {
+          titleParts.push(`${cameraSummary} registered`);
+        }
+        if (cameraDelta != null) {
+          titleParts.push(`${cameraDeltaLabel} cameras vs previous`);
+        }
+        const title = titleParts.join(" • ");
         return `
           <td class="matrix-cell" style="background:${background}" title="${escapeHtml(title)}">
-            ${formatValue(current)}
+            <div class="matrix-value">${formatValue(current)}</div>
+            <div class="matrix-camera-meta">
+              <span class="matrix-camera-count">${escapeHtml(cameraSummary)}</span>
+              <span class="matrix-camera-delta ${cameraDeltaClass}">${escapeHtml(cameraDeltaLabel)}</span>
+            </div>
           </td>
         `;
       }).join("");
@@ -304,6 +328,40 @@
       return "0.00";
     }
     return `${value >= 0 ? "+" : ""}${Number(value).toFixed(2)}`;
+  }
+
+  function formatCameraSummary(record) {
+    if (!record) {
+      return "--";
+    }
+    const registered = record[REGISTERED_IMAGES_KEY];
+    const total = record[TOTAL_IMAGES_KEY];
+    if (!Number.isFinite(registered) || !Number.isFinite(total)) {
+      return "--";
+    }
+    return `${registered}/${total}`;
+  }
+
+  function getCameraDelta(current, previous) {
+    if (!current || !previous) {
+      return null;
+    }
+    const currentValue = current[REGISTERED_IMAGES_KEY];
+    const previousValue = previous[REGISTERED_IMAGES_KEY];
+    if (!Number.isFinite(currentValue) || !Number.isFinite(previousValue)) {
+      return null;
+    }
+    return currentValue - previousValue;
+  }
+
+  function formatSignedCount(value) {
+    if (value == null) {
+      return "--";
+    }
+    if (value === 0) {
+      return "0";
+    }
+    return `${value > 0 ? "+" : ""}${value}`;
   }
 
   function formatDate(value, compact) {

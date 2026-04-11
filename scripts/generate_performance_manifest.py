@@ -16,6 +16,8 @@ SUMMARY_SCOPE = "summary_avg"
 SCENE_SCOPE = "scene"
 AVERAGE_KEY = "__average__"
 METRIC_PREFIXES = ("AUC",)
+REGISTERED_IMAGES_KEY = "num_reg_images"
+TOTAL_IMAGES_KEY = "num_images"
 FILENAME_PATTERNS = (
     re.compile(r"^(?P<dataset>.+?)(?:__|--)(?P<commit>[0-9a-f]{7,40})$", re.IGNORECASE),
     re.compile(r"^(?P<commit>[0-9a-f]{7,40})$", re.IGNORECASE),
@@ -154,6 +156,8 @@ def parse_csv(csv_path: Path):
         reader = csv.DictReader(handle)
         fieldnames = reader.fieldnames or []
         metrics = [name for name in fieldnames if name and name.startswith(METRIC_PREFIXES)]
+        has_registered_images = REGISTERED_IMAGES_KEY in fieldnames
+        has_total_images = TOTAL_IMAGES_KEY in fieldnames
         summary = None
         scenes = OrderedDict()
 
@@ -168,6 +172,9 @@ def parse_csv(csv_path: Path):
                 for metric in metrics
             }
             values[AVERAGE_KEY] = average_metric(values.values())
+            if scope == SCENE_SCOPE and scene_name:
+                values[REGISTERED_IMAGES_KEY] = to_int(row.get(REGISTERED_IMAGES_KEY)) if has_registered_images else None
+                values[TOTAL_IMAGES_KEY] = to_int(row.get(TOTAL_IMAGES_KEY)) if has_total_images else None
 
             if scope == SUMMARY_SCOPE:
                 summary = values
@@ -200,6 +207,15 @@ def to_float(value):
         if value is None or value == "":
             return None
         return float(value)
+    except ValueError:
+        return None
+
+
+def to_int(value):
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
     except ValueError:
         return None
 

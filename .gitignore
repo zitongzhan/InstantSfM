@@ -1,0 +1,15 @@
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Python tooling
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
